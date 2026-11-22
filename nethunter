@@ -1,0 +1,143 @@
+
+name: Redmi 10C NetHunter Kernel Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fog-devel
+    paths:
+      - '.github/workflows/**'
+      - 'patches/**'
+      - '**.c'
+      - '**.h'
+      - '**.config'
+      - 'Makefile'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Fog Kernel
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Onettboots kernel
+        uses: actions/checkout@v4
+        with:
+          ref: fog-devel
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            bc bison flex \
+            libssl-dev libelf-dev \
+            libncurses-dev \
+            python3 python-is-python3 \
+            git curl wget zip \
+            binutils-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi
+
+      - name: Download Android Clang 17
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/toolchain/clang"
+          wget -q \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r498229b.tar.gz" \
+            -O clang.tar.gz
+          tar -xf clang.tar.gz -C "$GITHUB_WORKSPACE/toolchain/clang"
+          echo "$GITHUB_WORKSPACE/toolchain/clang/bin" >> "$GITHUB_PATH"
+
+      - name: Verify compiler
+        run: |
+          clang --version
+          aarch64-linux-gnu-gcc --version
+
+      - name: Check source and patch directory
+        run: |
+          test -f Makefile
+          test -f arch/arm64/configs/vendor/fog_defconfig
+          mkdir -p patches
+          echo "Kernel source and defconfig found."
+          echo "Available patches:"
+          ls -lh patches/*.patch 2>/dev/null || true
+
+      - name: Apply WiFi patches when available
+        run: |
+          set -e
+          shopt -s nullglob
+          patch_files=(patches/*.patch)
+
+          if [ ${#patch_files[@]} -eq 0 ]; then
+            echo "No patches uploaded yet. Building baseline kernel."
+          else
+            for patch in "${patch_files[@]}"; do
+              echo "Checking: $patch"
+              git apply --check "$patch"
+              git apply "$patch"
+              echo "Applied: $patch"
+            done
+          fi
+
+      - name: Configure Redmi 10C
+        run: |
+          make O=out ARCH=arm64 vendor/fog_defconfig
+
+          scripts/config --file out/.config \
+            -e PACKET \
+            -e CFG80211
+
+          make O=out ARCH=arm64 olddefconfig
+
+          echo "===== WiFi configuration ====="
+          grep -E 'CONFIG_(PACKET|CFG80211|QCA_CLD_WLAN)=' out/.config || true
+
+      - name: Build kernel
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            Image.gz dtbs 2>&1 | tee build.log
+
+      - name: Verify build outputs
+        if: success()
+        run: |
+          test -f out/arch/arm64/boot/Image.gz
+          cp out/.config kernel.config
+
+          echo "===== Kernel ====="
+          ls -lh out/arch/arm64/boot/Image.gz
+
+          echo "===== Device trees ====="
+          find out/arch/arm64/boot/dts -type f -name '*.dtb'
+
+      - name: Upload successful build
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Redmi10C-NetHunter-Kernel
+          path: |
+            out/arch/arm64/boot/Image.gz
+            out/arch/arm64/boot/dts/**/*.dtb
+            kernel.config
+            build.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload failed build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Redmi10C-Build-Error-Log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 14
